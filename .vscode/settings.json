@@ -1,0 +1,8 @@
+{
+    "files.associations": {
+        "stdint.h": "c",
+        "mqueue.h": "c",
+        "msgbus_port.h": "c",
+        "fcntl.h": "c"
+    }
+}
