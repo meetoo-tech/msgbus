@@ -28,7 +28,7 @@ static void *msgbus_test_thread_handler(void *arg)
         {
             switch (msg->topic)
             {
-            case BUS_TOPIC_SYNC_OVER:
+            case MSG_TOPIC_SYNC_OVER:
                 break;
 
             case MSG_TOPIC_TEST1:
@@ -42,7 +42,7 @@ static void *msgbus_test_thread_handler(void *arg)
 }
 
 static const msgbus_topic_t test_topic_list[] = {
-    MSG_TOPIC_SET_LOCAL(BUS_TOPIC_SYNC_OVER),
+    MSG_TOPIC_SET_LOCAL(MSG_TOPIC_SYNC_OVER),
     MSG_TOPIC_TEST1,
 };
 

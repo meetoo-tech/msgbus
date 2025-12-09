@@ -1,5 +1,4 @@
 #include "msgbus.h"
-
 #include "rbtree.h"
 #include "sslist.h"
 #include "bitmap.h"
@@ -7,13 +6,13 @@
 
 enum
 {
-    TOPIC_BUS_SUB = BUS_TOPIC_SYSTEM_TOPIC_MAX,
+    TOPIC_BUS_SUB = MSG_TOPIC_SYSTEM_TOPIC_MAX,
     TOPIC_BUS_SYNC,
     TOPIC_BUS_EXT_SYNC,
 };
 
 /* 获取用户主题，通过最大值限制来实现 */
-#define GET_USER_TOPIC(__topic) ((__topic) & BUS_TOPIC_MAX)
+#define GET_USER_TOPIC(__topic) ((__topic) & MSG_TOPIC_MAX)
 
 /* 检查topic是否为为本地 */
 #define MSG_TOPIC_IS_LOCAL(__topic) ((__topic) & (0x80u << 24))
@@ -26,9 +25,10 @@ enum
 
 typedef struct
 {
-    struct slist_head node;   // 订阅列表节点
-    msgbus_user_t user_id;    // 用户标识符
-    msgbus_channel_t channel; // 接收数据队列
+    struct slist_head node;      // 订阅列表节点
+    msgbus_user_t user_id;       // 用户标识符
+    msgbus_channel_t channel;    // 接收数据队列
+    uint32_t user_local_sub : 1; // 用户本地订阅
 } sub_user_node_t;
 
 typedef struct
@@ -37,7 +37,6 @@ typedef struct
     uint32_t topic_key;              // 主题键
     struct slist_head sub_user_list; // 订阅的用户列表
     bitmap_t sub_bus_map;            // 外部总线订阅表
-    uint32_t user_local_sub : 1;     // 用户本地订阅
 } topic_node_t;
 
 typedef struct
@@ -122,7 +121,7 @@ static int32_t msg_topic_insert(struct rb_root *root, topic_node_t *data)
     return 0;
 }
 
-static int32_t msg_bus_proc_event_publish(msgbus_msg_t *bus_msg)
+static int32_t msgbus_proc_event_publish(msgbus_msg_t *bus_msg)
 {
     int32_t err = -1;
     topic_node_t *topic_node;
@@ -130,7 +129,8 @@ static int32_t msg_bus_proc_event_publish(msgbus_msg_t *bus_msg)
     uint32_t sender_bus_id = bus_msg->user_id;
 
     user_topic = GET_USER_TOPIC(bus_msg->topic);
-    MBUS_PRINTF("[MBUS] proc event pub, topic: %" PRIu32 " bus id:%" PRIu32 "\r\n", bus_msg->topic, bus_msg->user_id);
+    MBUS_PRINTF("[MBUS] proc event pub, topic: %" PRIu32 " bus id:%" PRIu32 "\r\n",
+                bus_msg->topic, bus_msg->user_id);
     topic_node = msg_topic_search(&msgbus_ctx.topic_tree, user_topic);
     if (topic_node)
     {
@@ -144,11 +144,13 @@ static int32_t msg_bus_proc_event_publish(msgbus_msg_t *bus_msg)
             sub_user = slist_entry(pos, sub_user_node_t, node);
             bus_msg->user_id = sub_user->user_id;
             bus_msg->topic = user_topic;
-            err = msgbus_port_channel_send(sub_user->channel, (const void *)bus_msg, sizeof(msgbus_msg_t) + bus_msg->len);
+            err = msgbus_port_channel_send(sub_user->channel, (const void *)bus_msg,
+                                           sizeof(msgbus_msg_t) + bus_msg->len);
             // MBUS_ASSERT(err == 0);
             if (err != 0)
             {
-                MBUS_PRINTF("[MBUS] Publish channel:%" PRIu32 "Topic:%" PRIu32 " failed\n", (uint32_t)sub_user->channel, bus_msg->topic);
+                MBUS_PRINTF("[MBUS] Publish channel:%" PRIu32 "Topic:%" PRIu32 " failed\n",
+                            (uint32_t)sub_user->channel, bus_msg->topic);
             }
         }
         if (!MSG_TOPIC_IS_LOCAL(bus_msg->topic) &&
@@ -175,7 +177,7 @@ static int32_t msg_bus_proc_event_publish(msgbus_msg_t *bus_msg)
     return err;
 }
 
-static topic_node_t *msg_bus_create_topic_node(uint32_t topic)
+static topic_node_t *msgbus_create_topic_node(uint32_t topic)
 {
     topic_node_t *topic_node;
 
@@ -191,47 +193,56 @@ static topic_node_t *msg_bus_create_topic_node(uint32_t topic)
     return topic_node;
 }
 
-static msgbus_msg_t *msg_bus_create_topic_sync_data(uint32_t except_bus_id)
+static msgbus_msg_t *msgbus_create_topic_sync_data(uint32_t except_bus_id)
 {
     topic_sync_data_t *topic_sync_data = NULL;
     msgbus_msg_t *msg_port = NULL;
 
-    MBUS_PRINTF("[MBUS] msg_bus_create_topic_sync_data except bus id:%" PRIu32 "\r\n", except_bus_id);
-    if (msgbus_ctx.topic_total)
+    MBUS_PRINTF("[MBUS] msgbus_create_topic_sync_data except bus id:%" PRIu32 "\r\n", except_bus_id);
+
+    msg_port = MBUS_MALLOC(sizeof(msgbus_msg_t) + sizeof(topic_sync_data_t) +
+                           sizeof(msgbus_topic_t) * msgbus_ctx.topic_total);
+    MBUS_ASSERT(msg_port);
+    topic_sync_data = (topic_sync_data_t *)msg_port->msg_data;
+    // 遍历红黑树中的主题节点，创建订阅主题列表
+    topic_node_t *topic_node;
+    struct rb_node *tree_node = rb_first(&msgbus_ctx.topic_tree);
+    uint32_t count = 0;
+    while (tree_node)
     {
-        msg_port = MBUS_MALLOC(sizeof(msgbus_msg_t) + sizeof(topic_sync_data_t) +
-                               sizeof(msgbus_topic_t) * msgbus_ctx.topic_total);
-        MBUS_ASSERT(msg_port);
-        topic_sync_data = (topic_sync_data_t *)msg_port->msg_data;
-        // 遍历红黑树中的主题节点，创建订阅主题列表
-        topic_node_t *topic_node;
-        struct rb_node *tree_node = rb_first(&msgbus_ctx.topic_tree);
-        uint32_t count = 0;
-        while (tree_node)
+        topic_node = container_of(tree_node, topic_node_t, node);
+        // 打包除指定消息总线外的其他主题列表
+        struct slist_head *pos;
+        int sub_user_cnt = 0;
+        slist_for_each(pos, &topic_node->sub_user_list)
         {
-            topic_node = container_of(tree_node, topic_node_t, node);
-            // 打包除指定消息总线外的其他主题列表
-            if (!slist_empty(&topic_node->sub_user_list) && !topic_node->user_local_sub)
+            sub_user_node_t *sub_user = slist_entry(pos, sub_user_node_t, node);
+            if (!sub_user->user_local_sub)
             { /* 存在用户的非本地订阅 */
                 topic_sync_data->topic_list[count++] = topic_node->topic_key;
-            }
-            else if (bitmap_cnt(&topic_node->sub_bus_map))
-            { /* 存在外部总线订阅 */
-                if (!except_bus_id ||
-                    bitmap_is_set(&topic_node->sub_bus_map, except_bus_id))
-                    topic_sync_data->topic_list[count++] = topic_node->topic_key;
-            }
-            /* 取下条主题节点 */
-            tree_node = rb_next(tree_node);
-            if (count >= msgbus_ctx.topic_total)
-            {
+                sub_user_cnt++;
                 break;
             }
         }
-        topic_sync_data->topic_num = count;
-        msg_port->len = sizeof(topic_sync_data_t) + sizeof(msgbus_topic_t) * count;
-        msg_port->topic = TOPIC_BUS_EXT_SYNC;
+        if (!sub_user_cnt)
+        { /*没有内部用户订阅，检查外部总线订阅 */
+            int sub_bus_cnt = bitmap_cnt(&topic_node->sub_bus_map);
+            if (sub_bus_cnt &&
+                (!except_bus_id || sub_bus_cnt > 1 || !bitmap_is_set(&topic_node->sub_bus_map, except_bus_id)))
+            {
+                topic_sync_data->topic_list[count++] = topic_node->topic_key;
+            }
+        }
+        /* 取下条主题节点 */
+        tree_node = rb_next(tree_node);
+        if (count >= msgbus_ctx.topic_total)
+        {
+            break;
+        }
     }
+    topic_sync_data->topic_num = count;
+    msg_port->len = sizeof(topic_sync_data_t) + sizeof(msgbus_topic_t) * count;
+    msg_port->topic = TOPIC_BUS_EXT_SYNC;
 
     return msg_port;
 }
@@ -252,7 +263,7 @@ static void msgbus_ext_bus_map_sync(void)
             uint32_t except_bus_id = bitmap_next(&msgbus_ctx.ext_bus_map, 0);
             while (except_bus_id)
             {
-                msg_port = msg_bus_create_topic_sync_data(except_bus_id);
+                msg_port = msgbus_create_topic_sync_data(except_bus_id);
                 msg_port->user_id = except_bus_id;
                 msgbus_port_send(msg_port);
                 MBUS_FREE(msg_port);
@@ -262,9 +273,9 @@ static void msgbus_ext_bus_map_sync(void)
             MBUS_ASSERT(msg_port);
             memset(msg_port, 0, sizeof(msgbus_msg_t));
             msg_port->user_id = LOCAL_BUS_ID;
-            msg_port->topic = MSG_TOPIC_SET_LOCAL(BUS_TOPIC_SYNC_OVER);
+            msg_port->topic = MSG_TOPIC_SET_LOCAL(MSG_TOPIC_SYNC_OVER);
             msg_port->len = 0;
-            msg_bus_proc_event_publish(msg_port);
+            msgbus_proc_event_publish(msg_port);
             MBUS_FREE(msg_port);
             msgbus_ctx.sync_over_flag = 1;
         }
@@ -272,7 +283,7 @@ static void msgbus_ext_bus_map_sync(void)
         { /* 只剩下一个未同步外部总线，向该总线发送当前主题列表 */
             uint32_t except_bus_id = bitmap_cmp(&msgbus_ctx.ext_bus_map,
                                                 &msgbus_ctx.ext_bus_map_sync);
-            msg_port = msg_bus_create_topic_sync_data(except_bus_id);
+            msg_port = msgbus_create_topic_sync_data(except_bus_id);
             msg_port->user_id = except_bus_id;
             msgbus_port_send(msg_port);
             MBUS_FREE(msg_port);
@@ -280,7 +291,7 @@ static void msgbus_ext_bus_map_sync(void)
     }
 }
 
-static int32_t msg_bus_proc_event_sync(void)
+static int32_t msgbus_proc_event_sync(void)
 {
     MBUS_PRINTF("[MBUS] proc event topic sync\r\n");
     msgbus_ctx.sync_start_flag = 1;
@@ -289,7 +300,7 @@ static int32_t msg_bus_proc_event_sync(void)
     return 0;
 }
 
-static void msg_bus_add_ext_sync_topic(msgbus_msg_t *bus_msg)
+static void msgbus_add_ext_sync_topic(msgbus_msg_t *bus_msg)
 {
     topic_node_t *topic_node;
     topic_sync_data_t *topic_sync_data = (topic_sync_data_t *)bus_msg->msg_data;
@@ -307,22 +318,19 @@ static void msg_bus_add_ext_sync_topic(msgbus_msg_t *bus_msg)
                                       GET_USER_TOPIC(topic_sync_data->topic_list[i]));
         if (topic_node == NULL)
         { // 当前主题不存在，新建
-            topic_node = msg_bus_create_topic_node(GET_USER_TOPIC(topic_sync_data->topic_list[i]));
+            topic_node = msgbus_create_topic_node(GET_USER_TOPIC(topic_sync_data->topic_list[i]));
             MBUS_PRINTF("[MBUS] extern topic not exist, create. topic: %" PRIu32 ", topic total:%d\r\n",
                         topic_sync_data->topic_list[i],
                         msgbus_ctx.topic_total);
         }
-        // 检查主题下的订阅列表，判断订阅用户是否为重复订阅
+        if (!bitmap_is_set(&topic_node->sub_bus_map, bus_msg->user_id))
         {
-            if (!bitmap_is_set(&topic_node->sub_bus_map, bus_msg->user_id))
-            {
-                bitmap_set(&topic_node->sub_bus_map, bus_msg->user_id);
-            }
+            bitmap_set(&topic_node->sub_bus_map, bus_msg->user_id);
         }
     }
 }
 
-static int32_t msg_bus_proc_event_ext_sync(msgbus_msg_t *bus_msg)
+static int32_t msgbus_proc_event_ext_sync(msgbus_msg_t *bus_msg)
 {
     // 指针直接传递，数据体为移植层动态申请的内存，在消息处理完毕后再释放。
     MBUS_PRINTF("[MBUS] recv_ext_msg, peer id:%" PRIu32 ",topic :%" PRIu32 ", len:%" PRIu32 "\r\n",
@@ -330,14 +338,14 @@ static int32_t msg_bus_proc_event_ext_sync(msgbus_msg_t *bus_msg)
     if (!bitmap_is_set(&msgbus_ctx.ext_bus_map_sync, bus_msg->user_id))
     { // 该外部总线没有同步过
         bitmap_set(&msgbus_ctx.ext_bus_map_sync, bus_msg->user_id);
-        msg_bus_add_ext_sync_topic(bus_msg);
+        msgbus_add_ext_sync_topic(bus_msg);
         msgbus_ext_bus_map_sync();
     }
 
     return 0;
 }
 
-static int32_t msg_bus_proc_event_subscribe(msgbus_msg_t *bus_msg)
+static int32_t msgbus_proc_event_subscribe(msgbus_msg_t *bus_msg)
 {
     topic_node_t *topic_node;
     uint32_t in_list = 0;
@@ -361,7 +369,7 @@ static int32_t msg_bus_proc_event_subscribe(msgbus_msg_t *bus_msg)
         topic_node = msg_topic_search(&msgbus_ctx.topic_tree, user_topic);
         if (topic_node == NULL)
         { // 当前主题不存在，新建
-            topic_node = msg_bus_create_topic_node(user_topic);
+            topic_node = msgbus_create_topic_node(user_topic);
             msgbus_ctx.topic_local_num++;
         }
         else
@@ -391,7 +399,7 @@ static int32_t msg_bus_proc_event_subscribe(msgbus_msg_t *bus_msg)
         }
         if (MSG_TOPIC_IS_LOCAL(topic_sub_data->topic_list[i]))
         {
-            topic_node->user_local_sub = 1;
+            sub_user_node->user_local_sub = 1;
         }
     }
 
@@ -403,19 +411,19 @@ void msgbus_system_msg_handler(msgbus_msg_t *bus_msg)
     switch (bus_msg->topic)
     {
     case TOPIC_BUS_SUB:
-        msg_bus_proc_event_subscribe(bus_msg);
+        msgbus_proc_event_subscribe(bus_msg);
         break;
 
     case TOPIC_BUS_SYNC:
-        msg_bus_proc_event_sync();
+        msgbus_proc_event_sync();
         break;
 
     case TOPIC_BUS_EXT_SYNC:
-        msg_bus_proc_event_ext_sync(bus_msg);
+        msgbus_proc_event_ext_sync(bus_msg);
         break;
 
     default:
-        msg_bus_proc_event_publish(bus_msg);
+        msgbus_proc_event_publish(bus_msg);
         break;
     }
 }
@@ -437,7 +445,7 @@ int32_t msgbus_subscribe(msgbus_channel_t channel, msgbus_user_t user_id,
     msgbus_msg_t *bus_msg;
     int32_t res = 0;
 
-    MBUS_PRINTF("[MBUS] msg_bus_subscribe ,user:%" PRIu32 ",topic num:%" PRIu32 "\r\n", user_id, topic_num);
+    MBUS_PRINTF("[MBUS] msgbus_subscribe ,user:%" PRIu32 ",topic num:%" PRIu32 "\r\n", user_id, topic_num);
     MBUS_ASSERT(topic_num);
 
     bus_msg = MBUS_MALLOC(sizeof(msgbus_msg_t) + sizeof(topic_sub_data_t) + sizeof(msgbus_topic_t) * topic_num);
@@ -469,7 +477,7 @@ int32_t msgbus_publish(msgbus_topic_t topic, const void *data, uint32_t data_len
     msgbus_msg_t *bus_msg;
     int32_t res = 0;
 
-    if (BUS_TOPIC_USER_MAX <= topic)
+    if (MSG_TOPIC_USER_MAX <= topic)
     {
         return -1;
     }
