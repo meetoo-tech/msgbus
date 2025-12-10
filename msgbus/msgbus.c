@@ -20,9 +20,6 @@ enum
 /* 检查topic是否为强制分发 */
 #define MSG_TOPIC_IS_DISPATCHED(__topic) ((__topic) & (0x40u << 24))
 
-/* 检查topic是否为强制分发 */
-#define MSG_TOPIC_IS_INTERNAL(__topic) ((__topic) & (0x01u << 24))
-
 typedef struct
 {
     struct slist_head node;      // 订阅列表节点
@@ -135,12 +132,12 @@ static int32_t msgbus_proc_event_publish(msgbus_msg_t *bus_msg)
     MBUS_PRINTF("[MBUS] proc event pub, topic: %" PRIu32 " bus id:%" PRIu32 "\r\n",
                 bus_msg->topic, bus_msg->user_id);
     topic_node = msg_topic_search(&msgbus_ctx.topic_tree, user_topic);
+    // 分发给本地订阅该主题的用户
     if (topic_node)
     {
         sub_user_node_t *sub_user;
         struct slist_head *pos;
 
-        // 将消息复制，并分发给本地订阅该主题的用户
         slist_for_each(pos, &topic_node->sub_user_list)
         {
             // 遍历订阅用户列表，依次发送消息
@@ -156,28 +153,43 @@ static int32_t msgbus_proc_event_publish(msgbus_msg_t *bus_msg)
                             sub_user->channel, bus_msg->topic);
             }
         }
-        if (!MSG_TOPIC_IS_LOCAL(bus_msg->topic) &&
-            bitmap_cnt(&topic_node->sub_bus_map))
-        { // 有外部总线订阅者
-            uint32_t sub_bus_id = bitmap_next(&topic_node->sub_bus_map, 0);
-
-            while (sub_bus_id)
-            {
-                if (sub_bus_id != sender_bus_id)
-                { // 转发时，排除原始发送者
-                    bus_msg->user_id = sub_bus_id;
-                    msgbus_ctx.channel_write_handler(msgbus_ctx.ext_bus_channel,
-                                                     bus_msg, SIZEOF_MSGBUS_MSG(bus_msg));
-                }
-                sub_bus_id = bitmap_next(&topic_node->sub_bus_map, sub_bus_id);
-            }
-        }
     }
     else
-    { // 不存在的主题，发布错误
-        MBUS_PRINTF("[MBUS] publish error unsubscribe topic, topic: %" PRIu32 "\r\n",
-                    bus_msg->topic);
+    {
+        if (!msgbus_ctx.selfness_flag)
+        { // 不存在的主题，发布错误
+            MBUS_PRINTF("[MBUS] publish error unsubscribe topic, topic: %" PRIu32 "\r\n",
+                        bus_msg->topic);
+            return -1;
+        }
     }
+    // 分发给外部总线
+    if (!MSG_TOPIC_IS_LOCAL(bus_msg->topic) &&
+        bitmap_cnt(&msgbus_ctx.ext_bus_map))
+    {
+        uint32_t sub_bus_id = msgbus_ctx.selfness_flag
+                                  ? bitmap_next(&msgbus_ctx.ext_bus_map, 0)
+                                  : bitmap_next(&topic_node->sub_bus_map, 0);
+
+        while (sub_bus_id)
+        {
+            if (sub_bus_id != sender_bus_id)
+            { // 转发时，排除原始发送者
+                bus_msg->user_id = sub_bus_id;
+                err = msgbus_ctx.channel_write_handler(msgbus_ctx.ext_bus_channel,
+                                                       bus_msg, SIZEOF_MSGBUS_MSG(bus_msg));
+                if (err != 0)
+                {
+                    MBUS_PRINTF("[MBUS] Publish Ext bus id:%" PRIu32 " channel:%p,Topic:%" PRIu32 " failed\n",
+                                bus_msg->user_id, msgbus_ctx.ext_bus_channel, bus_msg->topic);
+                }
+            }
+            sub_bus_id = msgbus_ctx.selfness_flag
+                             ? bitmap_next(&msgbus_ctx.ext_bus_map, sub_bus_id)
+                             : bitmap_next(&topic_node->sub_bus_map, sub_bus_id);
+        }
+    }
+
     return err;
 }
 
@@ -338,13 +350,15 @@ static void msgbus_add_ext_sync_topic(msgbus_msg_t *bus_msg)
 
 static int32_t msgbus_proc_event_ext_sync(msgbus_msg_t *bus_msg)
 {
-    // 指针直接传递，数据体为移植层动态申请的内存，在消息处理完毕后再释放。
     MBUS_PRINTF("[MBUS] recv_ext_msg, peer id:%" PRIu32 ",topic :%" PRIu32 ", len:%" PRIu32 "\r\n",
                 bus_msg->user_id, bus_msg->topic, bus_msg->len);
     if (!bitmap_is_set(&msgbus_ctx.ext_bus_map_sync, bus_msg->user_id))
     { // 该外部总线没有同步过
         bitmap_set(&msgbus_ctx.ext_bus_map_sync, bus_msg->user_id);
-        msgbus_add_ext_sync_topic(bus_msg);
+        if (!msgbus_ctx.selfness_flag)
+        {
+            msgbus_add_ext_sync_topic(bus_msg);
+        }
         msgbus_ext_bus_map_sync();
     }
 
@@ -488,7 +502,7 @@ int msgbus_publish(msgbus_topic_t topic, const void *data, int data_len)
     msgbus_msg_t *bus_msg;
     int32_t res = 0;
 
-    if (topic == MSG_TOPIC_NULL || MSG_TOPIC_USER_MAX <= topic)
+    if (topic == MSG_TOPIC_NULL || GET_USER_TOPIC(topic) >= MSG_TOPIC_USER_MAX)
     {
         return -1;
     }
