@@ -121,4 +121,8 @@ static inline uint32_t bitmap_cmp(bitmap_t *pbitmap1, bitmap_t *pbitmap2)
     return 0;
 }
 
+static inline void bitmap_copy(bitmap_t *pbitmap_dest, const bitmap_t *pbitmap_src)
+{
+    memcpy(pbitmap_dest, pbitmap_src, sizeof(bitmap_t));
+}
 #endif

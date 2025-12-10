@@ -6,7 +6,6 @@ set(INCS "")
 project(msgbus)
 
 list(APPEND SRCS  "msgbus/msgbus.c"
-        "msgbus/msgbus_port.c"
         "msgbus/rbtree.c"
         )
 

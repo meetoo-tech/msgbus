@@ -41,16 +41,19 @@ typedef struct
 
 typedef struct
 {
-    struct rb_root topic_tree;    // 主题红黑树
-    msgbus_channel_t bus_channel; // 内部事件队列
-    uint16_t bus_id;              // 当前总线编号
-    uint16_t topic_total;         // 当前主题总数量（本地+外部总线）
-    uint16_t topic_local_num;     // 本地已订阅的主题数量
-    uint16_t init_flag : 1;       // 已初始化标记
-    uint16_t sync_start_flag : 1; // 开始同步主题标记
-    uint16_t sync_over_flag : 1;  // 已完成同步主题标记
-    bitmap_t ext_bus_map;         // 外部总线表
-    bitmap_t ext_bus_map_sync;    // 已同步外部总线表
+    struct rb_root topic_tree;                         // 主题红黑树
+    msgbus_channel_t sys_channel;                      // 内部事件队列
+    msgbus_channel_t ext_bus_channel;                  // 外部总线队列
+    channel_msg_write_handler_t channel_write_handler; // 发送数据回调
+    uint16_t bus_id;                                   // 当前总线编号
+    uint16_t topic_total;                              // 当前主题总数量（本地+外部总线）
+    uint16_t topic_local_num;                          // 本地已订阅的主题数量
+    uint16_t init_flag : 1;                            // 已初始化标记
+    uint16_t selfness_flag : 1;                        // 自私模式，不同步外部总线的主题
+    uint16_t sync_start_flag : 1;                      // 开始同步主题标记
+    uint16_t sync_over_flag : 1;                       // 已完成同步主题标记
+    bitmap_t ext_bus_map;                              // 外部总线表
+    bitmap_t ext_bus_map_sync;                         // 已同步外部总线表
 } msgbus_context_t;
 
 typedef struct
@@ -144,13 +147,13 @@ static int32_t msgbus_proc_event_publish(msgbus_msg_t *bus_msg)
             sub_user = slist_entry(pos, sub_user_node_t, node);
             bus_msg->user_id = sub_user->user_id;
             bus_msg->topic = user_topic;
-            err = msgbus_port_channel_send(sub_user->channel, (const void *)bus_msg,
-                                           sizeof(msgbus_msg_t) + bus_msg->len);
+            err = msgbus_ctx.channel_write_handler(sub_user->channel, (const void *)bus_msg,
+                                                   SIZEOF_MSGBUS_MSG(bus_msg));
             // MBUS_ASSERT(err == 0);
             if (err != 0)
             {
-                MBUS_PRINTF("[MBUS] Publish channel:%" PRIu32 "Topic:%" PRIu32 " failed\n",
-                            (uint32_t)sub_user->channel, bus_msg->topic);
+                MBUS_PRINTF("[MBUS] Publish channel:%p,Topic:%" PRIu32 " failed\n",
+                            sub_user->channel, bus_msg->topic);
             }
         }
         if (!MSG_TOPIC_IS_LOCAL(bus_msg->topic) &&
@@ -163,7 +166,8 @@ static int32_t msgbus_proc_event_publish(msgbus_msg_t *bus_msg)
                 if (sub_bus_id != sender_bus_id)
                 { // 转发时，排除原始发送者
                     bus_msg->user_id = sub_bus_id;
-                    msgbus_port_send(bus_msg);
+                    msgbus_ctx.channel_write_handler(msgbus_ctx.ext_bus_channel,
+                                                     bus_msg, SIZEOF_MSGBUS_MSG(bus_msg));
                 }
                 sub_bus_id = bitmap_next(&topic_node->sub_bus_map, sub_bus_id);
             }
@@ -265,7 +269,8 @@ static void msgbus_ext_bus_map_sync(void)
             {
                 msg_port = msgbus_create_topic_sync_data(except_bus_id);
                 msg_port->user_id = except_bus_id;
-                msgbus_port_send(msg_port);
+                msgbus_ctx.channel_write_handler(msgbus_ctx.ext_bus_channel, msg_port,
+                                                 SIZEOF_MSGBUS_MSG(msg_port));
                 MBUS_FREE(msg_port);
                 except_bus_id = bitmap_next(&msgbus_ctx.ext_bus_map, except_bus_id);
             }
@@ -285,7 +290,8 @@ static void msgbus_ext_bus_map_sync(void)
                                                 &msgbus_ctx.ext_bus_map_sync);
             msg_port = msgbus_create_topic_sync_data(except_bus_id);
             msg_port->user_id = except_bus_id;
-            msgbus_port_send(msg_port);
+            msgbus_ctx.channel_write_handler(msgbus_ctx.ext_bus_channel, msg_port,
+                                             SIZEOF_MSGBUS_MSG(msg_port));
             MBUS_FREE(msg_port);
         }
     }
@@ -428,19 +434,24 @@ void msgbus_system_msg_handler(msgbus_msg_t *bus_msg)
     }
 }
 
-int32_t msgbus_init(void)
+int msgbus_init(msgbus_config_t *config)
 {
     memset(&msgbus_ctx, 0, sizeof(msgbus_ctx));
-    msgbus_ctx.bus_channel = msgbus_port_init();
+
+    msgbus_ctx.sys_channel = config->system_channel;
+    msgbus_ctx.ext_bus_channel = config->port_channel;
+    msgbus_ctx.channel_write_handler = config->channel_msg_write_handler;
+    msgbus_ctx.selfness_flag = config->is_selfness;
+    msgbus_ctx.bus_id = config->local_bus_id;
+    bitmap_copy(&msgbus_ctx.ext_bus_map, &config->ext_bus_map);
+
     msgbus_ctx.topic_tree = RB_ROOT;
-    msgbus_ctx.bus_id = msgbus_port_get_local_bus_id();
-    msgbus_port_get_ext_bus_map(&msgbus_ctx.ext_bus_map);
 
     return 0;
 }
 
-int32_t msgbus_subscribe(msgbus_channel_t channel, msgbus_user_t user_id,
-                         const msgbus_topic_t *topic_list, uint32_t topic_num)
+int msgbus_subscribe(msgbus_channel_t channel, msgbus_user_t user_id,
+                     const msgbus_topic_t *topic_list, int topic_num)
 {
     msgbus_msg_t *bus_msg;
     int32_t res = 0;
@@ -456,28 +467,28 @@ int32_t msgbus_subscribe(msgbus_channel_t channel, msgbus_user_t user_id,
     topic_sub_data->channel = channel;
     topic_sub_data->user_id = user_id;
     topic_sub_data->topic_num = topic_num;
-    memcpy(topic_sub_data->topic_list, topic_list, sizeof(uint32_t) * topic_num);
-    res = msgbus_port_channel_send(msgbus_ctx.bus_channel, bus_msg,
-                                   sizeof(msgbus_msg_t) + sizeof(topic_sub_data_t) + sizeof(msgbus_topic_t) * topic_num);
+    memcpy(topic_sub_data->topic_list, topic_list, sizeof(msgbus_topic_t) * topic_num);
+    res = msgbus_ctx.channel_write_handler(msgbus_ctx.sys_channel, bus_msg,
+                                           SIZEOF_MSGBUS_MSG(bus_msg));
     MBUS_FREE(bus_msg);
     return res;
 }
 
-int32_t msgbus_sync(void)
+int msgbus_sync(void)
 {
     msgbus_msg_t msg = {0};
 
     msg.topic = TOPIC_BUS_SYNC;
 
-    return msgbus_port_channel_send(msgbus_ctx.bus_channel, &msg, sizeof(msg));
+    return msgbus_ctx.channel_write_handler(msgbus_ctx.sys_channel, &msg, SIZEOF_MSGBUS_MSG(&msg));
 }
 
-int32_t msgbus_publish(msgbus_topic_t topic, const void *data, uint32_t data_len)
+int msgbus_publish(msgbus_topic_t topic, const void *data, int data_len)
 {
     msgbus_msg_t *bus_msg;
     int32_t res = 0;
 
-    if (MSG_TOPIC_USER_MAX <= topic)
+    if (topic == MSG_TOPIC_NULL || MSG_TOPIC_USER_MAX <= topic)
     {
         return -1;
     }
@@ -490,7 +501,7 @@ int32_t msgbus_publish(msgbus_topic_t topic, const void *data, uint32_t data_len
     {
         memcpy(bus_msg->msg_data, data, data_len);
     }
-    res = msgbus_port_channel_send(msgbus_ctx.bus_channel, bus_msg, sizeof(msgbus_msg_t) + data_len);
+    res = msgbus_ctx.channel_write_handler(msgbus_ctx.sys_channel, bus_msg, SIZEOF_MSGBUS_MSG(bus_msg));
     MBUS_FREE(bus_msg);
 
     return res;
